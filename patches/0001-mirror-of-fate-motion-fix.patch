@@ -1,0 +1,1410 @@
+diff --git a/src/android/app/src/main/jni/config.cpp b/src/android/app/src/main/jni/config.cpp
+index f5f80bf..1b49bb1 100644
+--- a/src/android/app/src/main/jni/config.cpp
++++ b/src/android/app/src/main/jni/config.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <iomanip>
+ #include <memory>
++#include <string>
+ #include <ranges>
+ #include <sstream>
+ #include <unordered_map>
+@@ -155,9 +156,25 @@ void Config::ReadValues() {
+     ReadSetting("Renderer", Settings::values.texture_filter);
+     ReadSetting("Renderer", Settings::values.texture_sampling);
+     ReadSetting("Renderer", Settings::values.turbo_limit);
+-    // Workaround to map Android setting for enabling the frame limiter to the format Citra expects
+-    if (android_config->GetBoolean("Renderer", "use_frame_limit", true)) {
++    // Workaround to map Android setting for enabling the frame limiter to the format Citra expects.
++    //
++    // The generated config template writes every key with an EMPTY value, and an empty boolean
++    // parses as false. An untouched install therefore came out with the limiter OFF, the
++    // else-branch below forced the limit to 0, and the guest was free to run a second frame loop
++    // inside a single presented frame -- games that pace themselves on render time then draw the
++    // character at a stale pose (foot sliding, torso snapping). Treat "key present but empty" as
++    // "never configured" and keep the limiter on; an explicit false / 0 is still honoured.
++    const std::string use_frame_limit_raw =
++        android_config->Get("Renderer", "use_frame_limit", std::string{});
++    const bool use_frame_limit =
++        use_frame_limit_raw.empty()
++            ? true
++            : android_config->GetBoolean("Renderer", "use_frame_limit", true);
++    if (use_frame_limit) {
+         ReadSetting("Renderer", Settings::values.frame_limit);
++        if (Settings::values.frame_limit.GetValue() <= 0.0) {
++            Settings::values.frame_limit = 100.0;
++        }
+     } else {
+         Settings::values.frame_limit = 0;
+     }
+@@ -179,7 +196,20 @@ void Config::ReadValues() {
+     ReadSetting("Renderer", Settings::values.bg_blue);
+     ReadSetting("Renderer", Settings::values.custom_second_layer_opacity);
+     ReadSetting("Renderer", Settings::values.delay_game_render_thread_us);
+-    ReadSetting("Renderer", Settings::values.simulate_3ds_gpu_timings);
++    // Same trap as use_frame_limit above: the generated template writes every key with an
++    // empty value, and an empty boolean parses as false. This key gates the entire GPU timing
++    // model in gsp_gpu.cpp, so with it false the modelled GPU time becomes zero, one guest loop
++    // costs ~11 ms instead of ~17 ms, and the guest fits 1.5 loops inside a single presented
++    // frame -- duplicate poses at stale positions, i.e. the folding-waist defect, while the
++    // frame rate still looks healthy. Treat "key present but empty" as "never configured".
++    {
++        const std::string simulate_gpu_raw =
++            android_config->Get("Renderer", "simulate_3ds_gpu_timings", std::string{});
++        if (!simulate_gpu_raw.empty()) {
++            Settings::values.simulate_3ds_gpu_timings =
++                android_config->GetBoolean("Renderer", "simulate_3ds_gpu_timings", true);
++        }
++    }
+     ReadSetting("Renderer", Settings::values.disable_right_eye_render);
+     ReadSetting("Renderer", Settings::values.swap_eyes_3d);
+     ReadSetting("Renderer", Settings::values.render_3d_which_display);
+diff --git a/src/common/settings.h b/src/common/settings.h
+index c83f322..d3b7872 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -557,7 +557,10 @@ struct Values {
+                                                         Keys::texture_sampling};
+     SwitchableSetting<u16, true> delay_game_render_thread_us{0, 0, 65000,
+                                                              Keys::delay_game_render_thread_us};
+-    SwitchableSetting<bool> simulate_3ds_gpu_timings{false, Keys::simulate_3ds_gpu_timings};
++    // Defaults to on: without the timing model, GPU work completes instantly, the guest's own
++    // frame loop comes out shorter than the real console's, and games that pace themselves on
++    // render time run an extra loop inside one presented frame. That is the sliding/folding bug.
++    SwitchableSetting<bool> simulate_3ds_gpu_timings{true, Keys::simulate_3ds_gpu_timings};
+ 
+     SwitchableSetting<LayoutOption> layout_option{LayoutOption::Default, Keys::layout_option};
+     SwitchableSetting<bool> swap_screen{false, Keys::swap_screen};
+diff --git a/src/core/perf_stats.cpp b/src/core/perf_stats.cpp
+index 9cfca48..2242ce7 100644
+--- a/src/core/perf_stats.cpp
++++ b/src/core/perf_stats.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <iterator>
+ #include <mutex>
+ #include <numeric>
+@@ -12,10 +15,12 @@
+ #include <fmt/chrono.h>
+ #include <fmt/format.h>
+ #include "common/file_util.h"
++#include "common/logging/log.h"
+ #include "common/settings.h"
+ #include "core/core_timing.h"
+ #include "core/perf_stats.h"
+ #include "video_core/gpu.h"
++#include "core/render_census.h"
+ 
+ using namespace std::chrono_literals;
+ using DoubleSecs = std::chrono::duration<double, std::chrono::seconds::period>;
+@@ -230,7 +235,117 @@ void FrameLimiter::WaitOnce() {
+     }
+ }
+ 
++namespace {
++// Diagnostic channel for the pacing loop: AZAHAR_PACE_LOG=<file> writes one row per presented
++// frame. This exists to answer "why does only one stretch of the map slide?" with numbers instead
++// of guesses -- it shows the exact frame where the limiter stops sleeping and starts catching up.
++struct PaceLog {
++    FILE* f = nullptr;
++    bool tried = false;
++
++    void write(long long frame, long long sys_us, long long wall_us, long long err_before,
++               long long err_after, long long slept_us) {
++        if (!tried) {
++            tried = true;
++            const char* env = std::getenv("AZAHAR_PACE_LOG");
++            if (env != nullptr && env[0] != '\0') {
++                const char* path = (std::strcmp(env, "1") == 0) ? "azahar_pace.csv" : env;
++                f = std::fopen(path, "wb");
++                if (f != nullptr) {
++                    std::fputs("frame,sys_us,wall_us,err_before_us,err_after_us,slept_us\n", f);
++                }
++            }
++        }
++        if (f == nullptr) {
++            return;
++        }
++        std::fprintf(f, "%lld,%lld,%lld,%lld,%lld,%lld\n", frame, sys_us, wall_us, err_before,
++                     err_after, slept_us);
++        std::fflush(f);
++    }
++};
++PaceLog g_pace_log;
++
++// Rolling pacing statistics, emitted to logcat every kReportFrames presented frames.
++//
++// This exists because on Android there is no way to set AZAHAR_PACE_LOG (no env), so the CSV
++// channel is unavailable on a handheld. A one-line summary every 240 frames (4 s at 60 Hz) is
++// cheap enough to leave in and tells us the one number that matters:
++//   sys_avg / 16714us = guest frame loops per presented frame.
++// 1.0 means the guest and the display are locked; 2.0 means the character advances two animation
++// steps per displayed frame, which is what "foot sliding" looks like.
++struct PaceStats {
++    static constexpr u64 kReportFrames = 240;
++    static constexpr long long kFrameUs = 16714;  // one 3DS frame at 100% speed
++
++    u64 frames = 0;
++    long long sys_sum = 0;
++    long long wall_sum = 0;
++    long long slept_sum = 0;
++    long long sys_max = 0;
++    u64 over_1_2 = 0;  // >= 1.2 guest frames in one present
++    u64 over_1_8 = 0;  // >= 1.8, i.e. essentially two loops
++    u64 hist_2k[16] = {};  // sys_us bucketed per 2000us, saturating at 30ms
++
++    void add(long long sys_us, long long wall_us, long long slept_us) {
++        ++frames;
++        sys_sum += sys_us;
++        wall_sum += wall_us;
++        slept_sum += slept_us;
++        if (sys_us > sys_max) {
++            sys_max = sys_us;
++        }
++        if (sys_us * 10 >= kFrameUs * 12) {
++            ++over_1_2;
++        }
++        if (sys_us * 10 >= kFrameUs * 18) {
++            ++over_1_8;
++        }
++        const u64 bucket = static_cast<u64>(sys_us < 0 ? 0 : sys_us / 2000);
++        ++hist_2k[bucket < 15 ? bucket : 15];
++    }
++
++    long long percentile_us(u64 pct) const {
++        const u64 target = frames * pct / 100;
++        u64 acc = 0;
++        for (u64 i = 0; i < 16; ++i) {
++            acc += hist_2k[i];
++            if (acc >= target) {
++                return static_cast<long long>(i) * 2000 + 1000;
++            }
++        }
++        return sys_max;
++    }
++
++    void report_if_due() {
++        if (frames < kReportFrames) {
++            return;
++        }
++        const double sys_avg = double(sys_sum) / frames;
++        const double wall_avg = double(wall_sum) / frames;
++        LOG_INFO(Core,
++                 "PACESTATS frames={} sys_avg={:.0f} sys_p50={} sys_p90={} sys_max={} "
++                 "loops_per_frame={:.3f} wall_avg={:.0f} slept_avg={:.0f} ge12={} ge18={}",
++                 frames, sys_avg, percentile_us(50), percentile_us(90), sys_max,
++                 sys_avg / double(kFrameUs), wall_avg, double(slept_sum) / frames, over_1_2,
++                 over_1_8);
++        frames = 0;
++        sys_sum = 0;
++        wall_sum = 0;
++        slept_sum = 0;
++        sys_max = 0;
++        over_1_2 = 0;
++        over_1_8 = 0;
++        for (auto& slot : hist_2k) {
++            slot = 0;
++        }
++    }
++};
++PaceStats g_pace_stats;
++} // namespace
++
+ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
++    RenderCensus::OnPresentedFrame();
+     if (frame_advancing_enabled) {
+         // Frame advancing is enabled: wait on event instead of doing framelimiting
+         WaitForFrameAdvance();
+@@ -244,17 +359,54 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
+         return;
+     }
+ 
++    {
++        static bool logged_limit = false;
++        if (!logged_limit) {
++            logged_limit = true;
++            LOG_INFO(Core, "PACELIMIT frame_limit={:.1f} simulate_gpu_timings={} async_present={}",
++                     Settings::GetFrameLimit(), Settings::values.simulate_3ds_gpu_timings.GetValue(),
++                     Settings::values.async_presentation.GetValue());
++        }
++    }
++
+     // Max lag caused by slow frames. Shouldn't be more than the length of a frame at the current
+     // speed percent or it will clamp too much and prevent this from properly limiting to that
+     // percent. High values means it'll take longer after a slow frame to recover and start limiting
+     const microseconds max_lag_time_us = duration_cast<microseconds>(
+         std::chrono::duration<double, std::chrono::microseconds::period>(25ms / sleep_scale));
+-    frame_limiting_delta_err += duration_cast<microseconds>(
++    // How far the emulated clock may fall behind the wall clock before the limiter stops sleeping
++    // and lets the guest run flat out to "pay the debt back".
++    //
++    // Upstream allows max_lag_time_us (25 ms at 100% speed) of such debt. That window is what makes
++    // one stretch of a map slide while the rest of the game is fine: 25 ms is ~1.5 guest frames, so
++    // right after any frame-time spike -- a heavier background, a texture stream-in, a shader
++    // compile -- the guest renders an extra frame inside a single presented frame and the character
++    // is drawn at a pose ahead of its animation state. Real hardware never runs ahead: missing a
++    // VBlank costs the game a frame, it does not let it move further on the next one.
++    //
++    // Default is therefore 0. AZAHAR_PACE_CATCHUP_US restores the old behaviour for A/B runs.
++    static const microseconds max_catch_up_time_us = [] {
++        const char* env = std::getenv("AZAHAR_PACE_CATCHUP_US");
++        if (env != nullptr && env[0] != '\0') {
++            const long long value = std::atoll(env);
++            if (value >= 0) {
++                return microseconds{value};
++            }
++        }
++        return microseconds{0};
++    }();
++
++    const auto sys_delta_us = duration_cast<microseconds>(
+         std::chrono::duration<double, std::chrono::microseconds::period>(
+             (current_system_time_us - previous_system_time_us) / sleep_scale));
+-    frame_limiting_delta_err -= duration_cast<microseconds>(now - previous_walltime);
++    const auto wall_delta_us = duration_cast<microseconds>(now - previous_walltime);
++
++    frame_limiting_delta_err += sys_delta_us;
++    frame_limiting_delta_err -= wall_delta_us;
+     frame_limiting_delta_err =
+-        std::clamp(frame_limiting_delta_err, -max_lag_time_us, max_lag_time_us);
++        std::clamp(frame_limiting_delta_err, -max_catch_up_time_us, max_lag_time_us);
++    const auto err_before_sleep = frame_limiting_delta_err;
++    microseconds slept_us{0};
+ 
+     if (frame_limiting_delta_err > microseconds::zero()) {
+         if (wait_callback) {
+@@ -263,10 +415,20 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
+             std::this_thread::sleep_for(frame_limiting_delta_err);
+         }
+         auto now_after_sleep = Clock::now();
+-        frame_limiting_delta_err -= duration_cast<microseconds>(now_after_sleep - now);
++        slept_us = duration_cast<microseconds>(now_after_sleep - now);
++        frame_limiting_delta_err -= slept_us;
+         now = now_after_sleep;
+     }
+ 
++    {
++        static u64 pace_frame = 0;
++        g_pace_log.write(static_cast<long long>(pace_frame++), sys_delta_us.count(),
++                         wall_delta_us.count(), err_before_sleep.count(),
++                         frame_limiting_delta_err.count(), slept_us.count());
++        g_pace_stats.add(sys_delta_us.count(), wall_delta_us.count(), slept_us.count());
++        g_pace_stats.report_if_due();
++    }
++
+     previous_system_time_us = current_system_time_us;
+     previous_walltime = now;
+ }
+diff --git a/src/core/render_census.h b/src/core/render_census.h
+new file mode 100644
+index 0000000..8d1af2f
+--- /dev/null
++++ b/src/core/render_census.h
+@@ -0,0 +1,113 @@
++// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++// TEMPORARY INSTRUMENTATION -- renders-per-frame census.
++//
++// The sliding / folding-waist defect is "the guest rendered the whole scene more than once
++// inside one presented frame".  The authoritative metric is
++//
++//     renders_per_frame = character_draws / render_targets_per_scene / presented_frames
++//
++// and real hardware answers exactly 1.000.  Keeping this as plain counters plus one log
++// line per kReportFrames presented frames makes the metric readable on Android, where the
++// PICA file trace cannot be used at all.
++#pragma once
++
++#include "common/common_types.h"
++#include "common/logging/log.h"
++
++namespace RenderCensus {
++
++// The character mesh of the title under investigation, measured with the PICA trace.
++// Every other draw count is irrelevant here, so the check is exact rather than a range.
++constexpr u32 kCharacterVerts = 1704;
++// Where the 19-bone x 3-row skeleton palette sits in the VS float uniform file, and how many
++// vec4 slots it occupies.  Taken from the full-state uniform dump of this title.
++constexpr u32 kPaletteFirstSlot = 25;
++constexpr u32 kPaletteSlots = 57;
++// How many render targets one whole-scene render draws the character into:
++// the main colour target plus two shadow cascades.
++constexpr u32 kRenderTargetsPerScene = 3;
++// A submit that is a whole-scene command list rather than a small state-only batch.
++constexpr u32 kBigSubmitBytes = 100000;
++// One report roughly every four seconds at 60 Hz.
++constexpr u64 kReportFrames = 240;
++
++struct Counters {
++    u64 frames = 0;
++    u64 draws = 0;
++    u64 chars = 0;
++    u64 subs = 0;
++    // Distinct skeleton palettes seen for the character inside the current presented frame.
++    // This is the direct symptom metric and does not depend on knowing how many render
++    // targets one scene render touches: one pose per frame is correct, two is the defect.
++    u32 poses = 0;
++    u64 pose_sum = 0;
++    u32 pose_hash[8] = {};
++};
++
++inline Counters& C() {
++    static Counters c;
++    return c;
++}
++
++inline u32 Djb2(const void* data, std::size_t len) {
++    const auto* p = static_cast<const u8*>(data);
++    u32 h = 5381u;
++    for (std::size_t i = 0; i < len; ++i) {
++        h = ((h << 5) + h) ^ static_cast<u32>(p[i]);
++    }
++    return h;
++}
++
++// `pal` points at the 19-bone x 3-row skeleton palette living in the VS float uniforms.
++// Draws of the same pose hash identically, so the number of distinct hashes in one presented
++// frame is the number of different body poses that ended up on screen together.
++inline void OnDraw(u32 nverts, const void* pal, std::size_t pal_bytes) {
++    Counters& c = C();
++    ++c.draws;
++    if (nverts != kCharacterVerts) {
++        return;
++    }
++    ++c.chars;
++    const u32 h = Djb2(pal, pal_bytes);
++    for (u32 i = 0; i < c.poses; ++i) {
++        if (c.pose_hash[i] == h) {
++            return;
++        }
++    }
++    if (c.poses < 8) {
++        c.pose_hash[c.poses++] = h;
++    }
++}
++
++inline void OnSubmit(u32 bytes) {
++    if (bytes >= kBigSubmitBytes) {
++        ++C().subs;
++    }
++}
++
++// Called once per presented frame.  Reporting on the same cadence as PACESTATS keeps the
++// two lines vertically aligned in a log, which makes "timing says 1 guest frame but two
++// poses were on screen" visible at a glance.
++inline void OnPresentedFrame() {
++    Counters& c = C();
++    ++c.frames;
++    c.pose_sum += c.poses;
++    c.poses = 0;
++    if (c.frames < kReportFrames) {
++        return;
++    }
++    const double frames = static_cast<double>(c.frames);
++    const double renders = static_cast<double>(c.chars) /
++                           static_cast<double>(kRenderTargetsPerScene) / frames;
++    LOG_INFO(Core,
++             "RENDERSTATS frames={} draws_avg={:.1f} char_avg={:.2f} subs_avg={:.2f} "
++             "poses_per_frame={:.3f} renders_per_frame={:.3f}",
++             c.frames, static_cast<double>(c.draws) / frames,
++             static_cast<double>(c.chars) / frames, static_cast<double>(c.subs) / frames,
++             static_cast<double>(c.pose_sum) / frames, renders);
++    c = Counters{};
++}
++
++} // namespace RenderCensus
+diff --git a/src/core/savestate.cpp b/src/core/savestate.cpp
+index 16c3db6..c234480 100644
+--- a/src/core/savestate.cpp
++++ b/src/core/savestate.cpp
+@@ -2,7 +2,9 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
+ #include <chrono>
++#include <cstring>
+ #include <sstream>
+ #include <cryptopp/hex.h>
+ #include <fmt/ranges.h>
+@@ -68,7 +70,17 @@ static bool ValidateSaveState(const CSTHeader& header, SaveStateInfo& info, u64
+     const std::string build_version =
+         header.zero_2 == 0 ? reinterpret_cast<const char*>(header.build_version.data()) : "";
+ 
+-    if (revision == Common::g_scm_rev) {
++    // A build made without git metadata records a zero revision, because "UNKNOWN" is not hex and
++    // is stored as 20 zero bytes. Such a file can only have come from the same kind of build, so
++    // its archive layout is the one this binary was compiled against and it is safe to load even
++    // when the build-version tag is empty (older local builds never wrote that field at all). A
++    // file carrying a real git revision comes from a release build: its layout is not guaranteed
++    // to match, and loading one ends in a kernel assertion inside the deserialiser, so the strict
++    // tag comparison stays for that case.
++    const bool local_revision =
++        std::all_of(header.revision.begin(), header.revision.end(), [](u8 byte) { return byte == 0; });
++
++    if (revision == Common::g_scm_rev || local_revision) {
+         info.status = SaveStateInfo::ValidationStatus::OK;
+     } else {
+         info.build_name = build_name;
+@@ -175,10 +187,28 @@ void System::SaveState(u32 slot) const {
+     CSTHeader header{};
+     header.filetype = header_magic_bytes;
+     header.program_id = title_id;
++    // A build made without git metadata reports the literal "UNKNOWN", which is not valid hex.
++    // The decoder then emits nothing and the memcpy below reads 20 bytes past an empty string, so
++    // the revision stored in the header was whatever happened to sit in memory. Decide the value
++    // explicitly instead: a proper hex revision is stored as-is, anything else becomes 20 zero
++    // bytes. That is stable across runs and still differs from any real git hash.
+     std::string rev_bytes;
+-    CryptoPP::StringSource ss(Common::g_scm_rev, true,
+-                              new CryptoPP::HexDecoder(new CryptoPP::StringSink(rev_bytes)));
+-    std::memcpy(header.revision.data(), rev_bytes.data(), sizeof(header.revision));
++    {
++        const char* rev = Common::g_scm_rev != nullptr ? Common::g_scm_rev : "";
++        const std::size_t rev_len = std::strlen(rev);
++        const bool decodable =
++            rev_len >= 2 && (rev_len % 2) == 0 && std::all_of(rev, rev + rev_len, [](char ch) {
++                return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
++                       (ch >= 'A' && ch <= 'F');
++            });
++        if (decodable) {
++            CryptoPP::StringSource ss(
++                rev, true, new CryptoPP::HexDecoder(new CryptoPP::StringSink(rev_bytes)));
++        }
++    }
++    std::memset(header.revision.data(), 0, sizeof(header.revision));
++    std::memcpy(header.revision.data(), rev_bytes.data(),
++                std::min(rev_bytes.size(), sizeof(header.revision)));
+     header.time = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+@@ -186,6 +216,14 @@ void System::SaveState(u32 slot) const {
+     std::memset(header.build_name.data(), 0, sizeof(header.build_name));
+     std::memcpy(header.build_name.data(), build_fullname.c_str(),
+                 std::min(build_fullname.length(), sizeof(header.build_name) - 1));
++    // This file-writing path used to leave build_version empty while SaveStateBuffer filled it in,
++    // so a state saved by the emulator itself carried no version tag and was then rejected on load
++    // as coming from a different build. Write it here too; the two paths must produce identical
++    // headers.
++    const std::string build_version = Common::g_build_version;
++    std::memset(header.build_version.data(), 0, sizeof(header.build_version));
++    std::memcpy(header.build_version.data(), build_version.c_str(),
++                std::min(build_version.length(), sizeof(header.build_version) - 1));
+ 
+     if (file.WriteBytes(&header, sizeof(header)) != sizeof(header) ||
+         file.WriteBytes(buffer.data(), buffer.size()) != buffer.size()) {
+@@ -255,10 +293,28 @@ std::vector<u8> System::SaveStateBuffer() const {
+     CSTHeader header{};
+     header.filetype = header_magic_bytes;
+     header.program_id = title_id;
++    // A build made without git metadata reports the literal "UNKNOWN", which is not valid hex.
++    // The decoder then emits nothing and the memcpy below reads 20 bytes past an empty string, so
++    // the revision stored in the header was whatever happened to sit in memory. Decide the value
++    // explicitly instead: a proper hex revision is stored as-is, anything else becomes 20 zero
++    // bytes. That is stable across runs and still differs from any real git hash.
+     std::string rev_bytes;
+-    CryptoPP::StringSource ss(Common::g_scm_rev, true,
+-                              new CryptoPP::HexDecoder(new CryptoPP::StringSink(rev_bytes)));
+-    std::memcpy(header.revision.data(), rev_bytes.data(), sizeof(header.revision));
++    {
++        const char* rev = Common::g_scm_rev != nullptr ? Common::g_scm_rev : "";
++        const std::size_t rev_len = std::strlen(rev);
++        const bool decodable =
++            rev_len >= 2 && (rev_len % 2) == 0 && std::all_of(rev, rev + rev_len, [](char ch) {
++                return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
++                       (ch >= 'A' && ch <= 'F');
++            });
++        if (decodable) {
++            CryptoPP::StringSource ss(
++                rev, true, new CryptoPP::HexDecoder(new CryptoPP::StringSink(rev_bytes)));
++        }
++    }
++    std::memset(header.revision.data(), 0, sizeof(header.revision));
++    std::memcpy(header.revision.data(), rev_bytes.data(),
++                std::min(rev_bytes.size(), sizeof(header.revision)));
+     header.time = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+@@ -298,9 +354,11 @@ bool System::LoadStateBuffer(std::vector<u8> buffer) {
+         return false;
+     }
+     std::string revision = fmt::format("{:02x}", fmt::join(header.revision, ""));
+-    if (revision != Common::g_scm_rev) {
++    const bool local_revision =
++        std::all_of(header.revision.begin(), header.revision.end(), [](u8 byte) { return byte == 0; });
++    if (revision != Common::g_scm_rev && !local_revision) {
+         LOG_ERROR(Core,
+-                  "Save state file created from a different revision (core: {}, savestate: {})",
++                  "Save state buffer created from a different revision (core: {}, savestate: {})",
+                   Common::g_scm_rev, revision);
+         return false;
+     }
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 40f29fe..5c7174e 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -20,6 +20,7 @@
+ #include "video_core/renderer_software/sw_blitter.h"
+ #include "video_core/right_eye_disabler.h"
+ #include "video_core/video_core.h"
++#include "core/render_census.h"
+ 
+ namespace VideoCore {
+ 
+@@ -407,6 +408,7 @@ void GPU::SubmitCmdList(u32 index) {
+     // Forward command list processing to the PICA core.
+     const PAddr addr = config.GetPhysicalAddress(index);
+     const u32 size = config.GetSize(index);
++    RenderCensus::OnSubmit(size);
+     impl->pica.ProcessCmdList(addr, size,
+                               !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
+     config.trigger[index] = 0;
+diff --git a/src/video_core/pica/pica_core.cpp b/src/video_core/pica/pica_core.cpp
+index 910ebc2..00fd44d 100644
+--- a/src/video_core/pica/pica_core.cpp
++++ b/src/video_core/pica/pica_core.cpp
+@@ -11,9 +11,19 @@
+ #include "core/memory.h"
+ #include "video_core/debug_utils/debug_utils.h"
+ #include "video_core/pica/pica_core.h"
++#include "video_core/pica/pica_trace.h"
+ #include "video_core/pica/vertex_loader.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/shader/shader.h"
++#include "core/render_census.h"
++// ==== PICA_PROF_INCLUDES_BEGIN ====
++#include <array>
++#include <chrono>
++#include <fstream>
++// ==== SKIP_RED_INCLUDES_BEGIN ====
++#include <cstdio>
++// ==== SKIP_RED_INCLUDES_END ====
++// ==== PICA_PROF_INCLUDES_END ====
+ 
+ namespace Pica {
+ 
+@@ -254,7 +264,149 @@ static constexpr std::array<u32, 16> ExpandBitsToBytes = {
+  * On the other hand, if PICA debugging is enabled we should avoid optimizations
+  * that would make debugging more complicated.
+  */
++// ==== PICA_PROF_BLOCK_BEGIN ====
++namespace {
++struct PicaProf {
++    u64 lists = 0;
++    u64 fast_cmds = 0;
++    u64 slow_cmds = 0;
++    u64 slow_extra = 0;
++    u64 slow_badreg = 0;
++    u64 slow_same = 0;
++    u64 slow_special = 0;
++    std::array<u32, 0x400> hist{};
++    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++    int enabled = -1;
++
++    bool on() {
++        if (enabled < 0) {
++            std::ifstream probe("/sdcard/3ds/gpuprof_on");
++            enabled = probe.good() ? 1 : 0;
++        }
++        return enabled == 1;
++    }
++
++    void flush_if_due() {
++        const auto now = std::chrono::steady_clock::now();
++        const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
++        if (dt < 3000) {
++            return;
++        }
++        last = now;
++        std::ofstream f("/sdcard/3ds/picaprof.txt", std::ios::trunc);
++        if (!f) {
++            return;
++        }
++        const u64 tot = fast_cmds + slow_cmds;
++        f << "window_ms=" << dt << " lists=" << lists << " cmds=" << tot << (char)10;
++        f << "fast_cmds=" << fast_cmds << " pct="
++          << (tot ? 100.0 * static_cast<double>(fast_cmds) / tot : 0.0) << (char)10;
++        f << "slow_cmds=" << slow_cmds << " pct="
++          << (tot ? 100.0 * static_cast<double>(slow_cmds) / tot : 0.0) << (char)10;
++        f << "slow_extra=" << slow_extra << " slow_special=" << slow_special
++          << " slow_badreg=" << slow_badreg << (char)10;
++        f << "slow_same_value=" << slow_same << " pct_of_slow="
++          << (slow_cmds ? 100.0 * static_cast<double>(slow_same) / slow_cmds : 0.0)
++          << " pct_of_all=" << (tot ? 100.0 * static_cast<double>(slow_same) / tot : 0.0)
++          << (char)10;
++        // top 16 slow command ids
++        for (int k = 0; k < 16; ++k) {
++            u32 best = 0;
++            u32 best_id = 0xFFFFFFFF;
++            for (u32 i = 0; i < hist.size(); ++i) {
++                if (hist[i] > best) {
++                    best = hist[i];
++                    best_id = i;
++                }
++            }
++            if (best == 0) {
++                break;
++            }
++            f << "  slow_reg[0x" << std::hex << best_id << std::dec << "] cnt=" << best << (char)10;
++            hist[best_id] = 0;
++        }
++        lists = 0;
++        fast_cmds = 0;
++        slow_cmds = 0;
++        slow_extra = 0;
++        slow_special = 0;
++        slow_badreg = 0;
++        slow_same = 0;
++    }
++};
++PicaProf g_pica_prof;
++} // namespace
++// ==== PICA_PROF_BLOCK_END ====
++
++// ==== SKIP_RED_BLOCK_BEGIN ====
++namespace {
++struct SkipRedundant {
++    u64 checked = 0;
++    u64 same_plain = 0;
++    u64 same_extra = 0;
++    u64 same_special = 0;
++    u64 skipped = 0;
++    // Incremented on EVERY query, unlike `checked` which only advances while skipping
++    // is active. Keying the re-probe off `checked` was a performance bug: with the feature
++    // off, `checked` stays zero, (checked & 1023) == 0 is permanently true, and the probe
++    // below ran once per command. A scene submission is ~20k commands, so that cost a
++    // failed fopen per command -- 26 ms of the GPU thread's frame budget -- for a
++    // diagnostic that cannot even find its file on non-Android builds.
++    u64 calls = 0;
++    int enabled = -1;
++
++    bool on() {
++        // Re-read the toggle occasionally so on/off can be A/B'd without a restart, but never
++        // on the hot path: one probe per 256k queries is invisible, one per query is not.
++        // Keying this off `checked` (which only advances while skipping is active) made the
++        // probe run once per command whenever the feature was OFF -- one failed fopen per
++        // PICA command, ~26 ms of every frame's GPU thread budget. Hence the separate counter.
++        if (enabled < 0 || (++calls & 0x3FFFF) == 0) {
++            static const bool env_on = [] {
++                const char* e = std::getenv("AZAHAR_SKIP_REDUNDANT");
++                return e != nullptr && e[0] == '1';
++            }();
++            if (env_on) {
++                enabled = 1;
++            } else if (FILE* f = std::fopen("/sdcard/3ds/skipredundant_on", "rb")) {
++                std::fclose(f);
++                enabled = 1;
++            } else {
++                enabled = 0;
++            }
++        }
++        return enabled == 1;
++    }
++
++    void report_if_due() {
++        if ((checked & 0xFFFF) != 0) {
++            return;
++        }
++        if (FILE* f = std::fopen("/sdcard/3ds/skipredundant.txt", "w")) {
++            const u64 same = same_plain + same_extra + same_special;
++            std::fprintf(f,
++                         "checked=%llu same_total=%llu pct=%.2f "
++                         "same_plain=%llu same_extra=%llu same_special=%llu "
++                         "skipped=%llu skip_pct_of_checked=%.2f\n",
++                         static_cast<unsigned long long>(checked),
++                         static_cast<unsigned long long>(same),
++                         checked ? 100.0 * static_cast<double>(same) / checked : 0.0,
++                         static_cast<unsigned long long>(same_plain),
++                         static_cast<unsigned long long>(same_extra),
++                         static_cast<unsigned long long>(same_special),
++                         static_cast<unsigned long long>(skipped),
++                         checked ? 100.0 * static_cast<double>(skipped) / checked : 0.0);
++            std::fclose(f);
++        }
++    }
++};
++SkipRedundant g_skip;
++} // namespace
++// ==== SKIP_RED_BLOCK_END ====
++
+ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
++    chars_this_list = 0;
++    scene_floor_applied = false;
+     if (ignore_list) {
+         signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
+         return;
+@@ -262,6 +414,10 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
+ 
+     const u8* head = memory.GetPhysicalPointer(list);
+     cmd_list.Reset(list, head, size);
++    const bool pica_prof_on = g_pica_prof.on();
++    if (pica_prof_on) {
++        g_pica_prof.lists++;
++    }
+ 
+     bool stop_requested = false;
+     bool skip_fast_path = false;
+@@ -295,6 +451,15 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
+                     // If extra handling is needed stop and fallback to slower path.
+                     if (header.extra_data_length != 0 || header.cmd_id >= RegsInternal::NUM_REGS ||
+                         reg_impl_flags_lut[header.cmd_id].NeedsSpecialHandling()) {
++                        if (pica_prof_on) {
++                            if (header.extra_data_length != 0) {
++                                g_pica_prof.slow_extra++;
++                            } else if (header.cmd_id >= RegsInternal::NUM_REGS) {
++                                g_pica_prof.slow_badreg++;
++                            } else {
++                                g_pica_prof.slow_special++;
++                            }
++                        }
+                         skip_fast_path = true;
+                         break;
+                     }
+@@ -317,6 +482,10 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
+                         dirty_regs.Set(id);
+                     }
+                     cmd_list.current_index = index;
++                    if (pica_prof_on) {
++                        g_pica_prof.fast_cmds += run;
++                        g_pica_prof.flush_if_due();
++                    }
+ 
+                     // Continue from the while loop in case we reached the end of the list.
+                     continue;
+@@ -332,7 +501,51 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
+         const CommandHeader header{cmd_list.head[cmd_list.current_index++]};
+ 
+         // Write to the requested PICA register.
+-        WriteInternalReg(header.cmd_id, value, header.parameter_mask, stop_requested);
++        if (pica_prof_on) {
++            g_pica_prof.slow_cmds++;
++            if (header.cmd_id < g_pica_prof.hist.size()) {
++                g_pica_prof.hist[header.cmd_id]++;
++            }
++            const u32 prof_mask = ExpandBitsToBytes[header.parameter_mask];
++            if ((regs.internal.reg_array[header.cmd_id] & prof_mask) == (value & prof_mask)) {
++                g_pica_prof.slow_same++;
++            }
++        }
++        // ==== SKIP_RED_HOT_BEGIN ====
++        const bool skip_on = g_skip.on();
++        const u32 skip_mask = ExpandBitsToBytes[header.parameter_mask];
++        bool same_now = false;
++        if (skip_on) {
++            same_now = header.cmd_id < RegsInternal::NUM_REGS &&
++                       (regs.internal.reg_array[header.cmd_id] & skip_mask) ==
++                           (value & skip_mask);
++            g_skip.checked++;
++            if (same_now) {
++                if (header.extra_data_length != 0) {
++                    g_skip.same_extra++;
++                } else if (reg_impl_flags_lut[header.cmd_id].NeedsSpecialHandling()) {
++                    g_skip.same_special++;
++                } else {
++                    g_skip.same_plain++;
++                }
++            }
++        }
++        const bool can_skip = skip_on && same_now && header.extra_data_length == 0 &&
++                              !reg_impl_flags_lut[header.cmd_id].NeedsSpecialHandling();
++        if (can_skip) {
++            g_skip.skipped++;
++            // Keep the emulated PICA delay model identical to the non-skip path.
++            delay_generator.AddCommands(1);
++        } else {
++            WriteInternalReg(header.cmd_id, value, header.parameter_mask, stop_requested);
++        }
++        if (skip_on) {
++            g_skip.report_if_due();
++        }
++        // ==== SKIP_RED_HOT_END ====
++        if (pica_prof_on) {
++            g_pica_prof.flush_if_due();
++        }
+ 
+         // Write any extra paramters as well.
+         const u32 count = header.extra_data_length;
+@@ -438,6 +651,9 @@ void PicaCore::HandleSpecialRegBatch(u32 id, const u32* values, u32 count) {
+     case PICA_REG_INDEX(vs.uniform_setup.set_value[6]):
+     case PICA_REG_INDEX(vs.uniform_setup.set_value[7]): {
+         const auto range = vs_setup.WriteUniformFloatRegRange(regs.internal.vs, values, count);
++        if (range) {
++            MoFTrace::NoteUniformWrite(range->first_index, range->count, values);
++        }
+         if (range && !regs.internal.pipeline.gs_unit_exclusive_configuration &&
+             regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
+             for (u32 i = 0; i < range->count; ++i) {
+@@ -581,8 +797,19 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
+         // TODO(PabloMK7): This logic is not fully accurate, but close enough:
+         // https://problemkaputt.de/gbatek-3ds-gpu-internal-registers-finalize-interrupt-registers.htm
+         if (any_byte_match(regs.internal.reg_array[id], regs.internal.irq_compare)) [[likely]] {
+-            signal_interrupt(Service::GSP::InterruptId::P3D,
+-                             delay_generator.CalculateAndResetDelay());
++            u64 p3d_delay = delay_generator.CalculateAndResetDelay();
++            // A command list that drew the character is a scene render. Charge it the realistic
++            // minimum instead of whatever the triangle count suggests, so a light map segment
++            // cannot leave the guest enough spare time to render the scene into the same buffer
++            // a second time.
++            if (chars_this_list > 0 && !scene_floor_applied) {
++                const u64 floor_ns = DelayGenerator::MinSceneDelayNs();
++                if (p3d_delay < floor_ns) {
++                    p3d_delay = floor_ns;
++                }
++                scene_floor_applied = true;
++            }
++            signal_interrupt(Service::GSP::InterruptId::P3D, p3d_delay);
+             if (regs.internal.irq_autostop) [[likely]] {
+                 stop_requested = true;
+             }
+@@ -618,6 +845,7 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
+         const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
+         const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
+         const u8* head = memory.GetPhysicalPointer(addr);
++        MoFTrace::NoteCmdList(addr, size);
+         cmd_list.Reset(addr, head, size);
+         break;
+     }
+@@ -1046,6 +1274,79 @@ void PicaCore::DrawImmediate() {
+ 
+ void PicaCore::DrawArrays(bool is_indexed) {
+     MICROPROFILE_SCOPE(GPU_Drawing);
++    if (regs.internal.pipeline.num_vertices == RenderCensus::kCharacterVerts) {
++        ++chars_this_list;
++    }
++    // Counted before the diagnostic mute switch so the census reflects what the guest asked
++    // for, not what the tracing layer let through.
++    RenderCensus::OnDraw(regs.internal.pipeline.num_vertices,
++                         &vs_setup.uniforms.f[RenderCensus::kPaletteFirstSlot],
++                         RenderCensus::kPaletteSlots * sizeof(vs_setup.uniforms.f[0]));
++
++    // Emit the draw record only after the vertex path is known:
++    //   path 0 = hardware vertex batch
++    //   path 1 = hardware batch attempted but failed -> software fallback
++    //   path 2 = hardware path disabled up front (use_hw_shader off / GS / assembler not empty /
++    //            num_vertices % 3 != 0)
++    const auto mo_emit = [this](u32 mo_path) {
++        if (!MoFTrace::On()) {
++            return;
++        }
++        const auto& mo_pipe = regs.internal.pipeline;
++        const auto& mo_va = mo_pipe.vertex_attributes;
++
++        // Decode vertex slot 0 for EVERY path. The hardware path binds guest FCRAM directly as
++        // a vertex buffer (zero-copy), so this read-only decode is the only way to observe what
++        // the GPU is actually being fed.
++        AttributeBuffer mo_in{};
++        if (mo_pipe.num_vertices > 0) {
++            const VertexLoader mo_sample_vertex(memory, mo_pipe);
++            mo_sample_vertex.LoadVertex(mo_va.GetPhysicalBaseAddress(), 0, 0, mo_in,
++                                        input_default_attributes);
++        }
++
++        // base + data_offset is the only per-mesh address: GetPhysicalBaseAddress() alone is
++        // a constant 0x18000000 for every draw in this title.
++        const u32 mo_base = mo_va.GetPhysicalBaseAddress();
++        const u32 mo_addr0 = mo_base + static_cast<u32>(mo_va.attribute_loaders[0].data_offset);
++        const u32 mo_addr1 = mo_base + static_cast<u32>(mo_va.attribute_loaders[1].data_offset);
++        MoFTrace::NoteCensus(mo_addr0, mo_addr1, mo_pipe.num_vertices,
++                             static_cast<u32>(mo_pipe.use_gs.Value()), mo_path,
++                             &vs_setup.uniforms, sizeof(vs_setup.uniforms), mo_in.data(),
++                             sizeof(mo_in), vs_setup.GetProgramCodeHash(),
++                             vs_setup.GetSwizzleDataHash());
++
++        if (MoFTrace::WantDraw(mo_pipe.num_vertices)) {
++            std::array<float, 384> mo_f_uniforms;
++            for (u32 mo_i = 0; mo_i < 96; ++mo_i) {
++                const auto mo_arr = vs_setup.uniforms.f[mo_i].AsArray();
++                for (u32 mo_c = 0; mo_c < 4; ++mo_c) {
++                    mo_f_uniforms[mo_i * 4 + mo_c] = mo_arr[mo_c].ToFloat32();
++                }
++            }
++            MoFTrace::NoteUniformState(mo_pipe.num_vertices, mo_f_uniforms);
++
++            std::array<u32, 36> mo_cfg{};
++            for (u32 mo_i = 0; mo_i < 12; ++mo_i) {
++                mo_cfg[mo_i * 3 + 0] = static_cast<u32>(mo_va.GetFormat(mo_i));
++                mo_cfg[mo_i * 3 + 1] = static_cast<u32>(mo_va.GetNumElements(mo_i));
++                mo_cfg[mo_i * 3 + 2] = static_cast<u32>(mo_va.GetStride(mo_i));
++            }
++            MoFTrace::NoteAttrConfig(mo_cfg);
++
++            std::array<float, 64> mo_attrs;
++            for (u32 mo_a = 0; mo_a < 16; ++mo_a) {
++                const auto mo_av = mo_in[mo_a].AsArray();
++                for (u32 mo_ac = 0; mo_ac < 4; ++mo_ac) {
++                    mo_attrs[mo_a * 4 + mo_ac] = mo_av[mo_ac].ToFloat32();
++                }
++            }
++            MoFTrace::NoteVertex(0, mo_attrs, 16);
++        }
++
++        MoFTrace::NoteDraw(mo_va.GetPhysicalBaseAddress(), mo_pipe.num_vertices,
++                           static_cast<u32>(mo_pipe.use_gs.Value()), mo_path);
++    };
+ 
+     // Track vertex in the debug recorder.
+     if (debug_context) {
+@@ -1080,11 +1381,13 @@ void PicaCore::DrawArrays(bool is_indexed) {
+ 
+     // Attempt to use hardware vertex shaders if possible.
+     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
++        mo_emit(0);
+         return;
+     }
+ 
+     // We cannot accelerate the draw, so load and execute the vertex shader for each vertex.
+     LoadVertices(is_indexed);
++    mo_emit(accelerate_draw ? 1 : 2);
+ 
+     // Draw emitted triangles.
+     rasterizer->DrawTriangles();
+diff --git a/src/video_core/pica/pica_core.h b/src/video_core/pica/pica_core.h
+index 62b0495..a879686 100644
+--- a/src/video_core/pica/pica_core.h
++++ b/src/video_core/pica/pica_core.h
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <cstdlib>
++
+ #include "common/common_types.h"
+ #include "core/hle/service/gsp/gsp_interrupt.h"
+ #include "video_core/pica/dirty_regs.h"
+@@ -84,6 +86,59 @@ public:
+         triangle_count += triangles;
+     }
+ 
++    // Calibration knob for the timing model, overridable through the environment so it can be
++    // swept without a rebuild.
++    //
++    // The constants above deliberately assume a GPU twice as fast as the real PICA200 to keep the
++    // emulator fast. Games that pace themselves on how long rendering takes then get to run their
++    // loop more than once inside a single presented frame, which shows up as duplicate geometry
++    // drawn at stale positions ("sliding", "folding at the waist"). Cancelling that 2x assumption
++    // is what makes one guest frame occupy one presented frame.
++    //
++    // The shipped default is 1.6 rather than 1.0 because 1.6 was measured to be the best working
++    // point on Castlevania: Lords of Shadow - Mirror of Fate (58.5 fps / speed 0.98, versus
++    // 50.5 fps / 0.84 with the timing model off entirely). Android builds cannot set environment
++    // variables, so this has to be the compiled-in default rather than something an ini sets.
++    static double DelayScale() {
++        static const double scale = [] {
++            const char* env = std::getenv("AZAHAR_GPU_DELAY_SCALE");
++            if (env == nullptr || env[0] == '\0') {
++                return 1.6;
++            }
++            const double value = std::atof(env);
++            return (value > 0.0) ? value : 1.6;
++        }();
++        return scale;
++    }
++
++    // Floor for a command list that renders the scene, in nanoseconds.
++    //
++    // The triangle-count model answers "how expensive is this batch of geometry", which is not the
++    // same question as "how long does one scene render take". On segments with few triangles it
++    // charges three or four milliseconds, the guest sees nine spare milliseconds in the frame and
++    // renders the scene a second time -- into the buffer the first pass already wrote, because this
++    // title never flips between two -- which is the bent waist. Scaling the whole model up to cover
++    // that (DelayScale 1.6) works but overcharges the heavy segments, so instead give the scene
++    // command list a floor close to what the real hardware needs: 15 ms out of the 16.7 ms frame
++    // leaves no room for a second pass while still fitting inside one frame.
++    //
++    // Only lists that actually drew the character get the floor; state-only batches and the HUD
++    // keep the cheap model, otherwise every frame overruns and the frame rate collapses.
++    static u64 MinSceneDelayNs() {
++        static const u64 value = [] {
++            const char* env = std::getenv("AZAHAR_MIN_SCENE_DELAY_US");
++            double us = 15000.0;
++            if (env != nullptr && env[0] != '\0') {
++                const double parsed = std::atof(env);
++                if (parsed > 0.0) {
++                    us = parsed;
++                }
++            }
++            return static_cast<u64>(us * 1000.0);
++        }();
++        return value;
++    }
++
+     u64 CalculateAndResetDelay() {
+         float result = command_count * nanoseconds_per_command;
+ 
+@@ -94,7 +149,7 @@ public:
+         triangle_count = 0;
+         command_count = 0;
+ 
+-        return static_cast<u64>(result);
++        return static_cast<u64>(static_cast<double>(result) * DelayScale());
+     }
+ 
+ private:
+@@ -368,6 +423,13 @@ public:
+     ImmediateModeState immediate{};
+ 
+     DelayGenerator delay_generator{};
++    // Character draws seen in the command list being processed right now. Reset at the start of
++    // every list, read when the list signals completion: a list that drew the character is a scene
++    // render and earns the realistic minimum cost, everything else keeps the cheap model.
++    u32 chars_this_list{};
++    // The scene floor is charged at most once per command list, otherwise a list that signals
++    // completion twice would be billed twice and the frame would overrun.
++    bool scene_floor_applied{};
+ 
+ private:
+     friend class boost::serialization::access;
+diff --git a/src/video_core/pica/pica_trace.h b/src/video_core/pica/pica_trace.h
+new file mode 100755
+index 0000000..79be375
+--- /dev/null
++++ b/src/video_core/pica/pica_trace.h
+@@ -0,0 +1,341 @@
++// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
++// Licensed under GPLv2 or any later version
++// TEMPORARY INSTRUMENTATION - Mirror of Fate pose alternation investigation.
++// Enable by creating /tmp/azahar_pica_trace before launching.
++#pragma once
++
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "common/common_types.h"
++
++namespace MoFTrace {
++
++struct State {
++    int enabled = -1;
++    std::FILE* f = nullptr;
++    u64 frame = 0;
++    u64 draw_idx = 0;
++    u64 ucount = 0;
++    u64 ufirst = 0;
++    u64 ulast = 0;
++    u32 uxor = 0;
++    u32 ufirst_val = 0;
++};
++
++// Portable switch/output resolution.
++// Linux keeps its historical behaviour when the env vars are absent.
++inline const char* OutPath() {
++    static const char* p = std::getenv("AZAHAR_PICA_OUT");
++    if (p != nullptr && p[0] != '\0') {
++        return p;
++    }
++    return "/home/ms/mof_trace/pica.txt";
++}
++
++inline const char* TriggerPath() {
++    static const char* p = std::getenv("AZAHAR_PICA_TRIGGER");
++    if (p != nullptr && p[0] != '\0') {
++        return p;
++    }
++    return "/tmp/azahar_pica_trace";
++}
++
++inline bool Triggered() {
++    std::FILE* probe = std::fopen(TriggerPath(), "rb");
++    if (probe != nullptr) {
++        std::fclose(probe);
++        return true;
++    }
++    return false;
++}
++
++inline State& S() {
++    static State s;
++    return s;
++}
++
++inline bool On() {
++    State& s = S();
++    if (s.enabled < 0) {
++        if (Triggered()) {
++            s.f = std::fopen(OutPath(), "wb");
++        }
++        s.enabled = (s.f != nullptr) ? 1 : 0;
++    }
++    return s.enabled == 1;
++}
++
++inline void ResetUniforms() {
++    State& s = S();
++    s.ucount = 0;
++    s.ufirst = 0;
++    s.ulast = 0;
++    s.uxor = 0;
++    s.ufirst_val = 0;
++}
++
++inline void RecheckSwitch() {
++    State& s = S();
++    if (Triggered()) {
++        if (!s.f) {
++            s.f = std::fopen(OutPath(), "ab");
++            if (s.f) {
++                static char io_buf[1 << 20];
++                std::setvbuf(s.f, io_buf, _IOFBF, sizeof(io_buf));
++            }
++        }
++        s.enabled = (s.f != nullptr) ? 1 : 0;
++    } else {
++        if (s.f) {
++            std::fclose(s.f);
++            s.f = nullptr;
++        }
++        s.enabled = 0;
++    }
++}
++
++inline void BeginFrame(u32 api) {
++    RecheckSwitch();
++    if (!On()) {
++        return;
++    }
++    State& s = S();
++    ++s.frame;
++    s.draw_idx = 0;
++    ResetUniforms();
++    std::fprintf(s.f, "F %llu %u %lld\n", static_cast<unsigned long long>(s.frame), api,
++                 static_cast<long long>(
++                     std::chrono::duration_cast<std::chrono::milliseconds>(
++                         std::chrono::system_clock::now().time_since_epoch())
++                         .count()));
++}
++
++inline u32 Djb2(const void* data, std::size_t len) {
++    const auto* p = static_cast<const u8*>(data);
++    u32 h = 5381u;
++    for (std::size_t i = 0; i < len; ++i) {
++        h = ((h << 5) + h) ^ static_cast<u32>(p[i]);
++    }
++    return h;
++}
++
++// Full per-draw dumps are ~700x larger than the census, so they stay opt-in.
++inline bool FullDump() {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char* e = std::getenv("AZAHAR_PICA_FULL");
++        enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
++    }
++    return enabled == 1;
++}
++
++// 0 = dump every draw, otherwise only draws with this exact vertex count.
++inline u32 FocusNverts() {
++    static u32 focus = 0xFFFFFFFFu;
++    if (focus == 0xFFFFFFFFu) {
++        const char* e = std::getenv("AZAHAR_PICA_FOCUS_NVERTS");
++        focus = (e != nullptr && e[0] != '\0') ? static_cast<u32>(std::strtoul(e, nullptr, 10)) : 0u;
++    }
++    return focus;
++}
++
++inline bool WantDraw(u32 nverts) {
++    if (!FullDump()) {
++        return false;
++    }
++    const u32 focus = FocusNverts();
++    return focus == 0u || nverts == focus;
++}
++
++// One cheap line per draw, covering the WHOLE frame. hashU changes when the VS uniform file
++// changed relative to the previous draw of this index; hashV does the same for vertex slot 0.
++// A skinned mesh fed from a static FCRAM buffer shows hashV constant + hashU moving; a CPU
++// skinned mesh shows hashV moving.
++// X <frame> <draw> <base> <nverts> <ucount> <use_gs> <path> <hashU> <hashV>
++inline void NoteCensus(u32 addr0, u32 addr1, u32 nverts, u32 use_gs, u32 path,
++                       const void* uni, std::size_t uni_bytes, const void* vtx,
++                       std::size_t vtx_bytes, u64 hash_prog, u64 hash_swz) {
++    if (!On()) {
++        return;
++    }
++    State& s = S();
++    std::fprintf(s.f, "X %llu %llu %08X %08X %u %llu %u %u %08X %08X %016llX %016llX\n",
++                 static_cast<unsigned long long>(s.frame),
++                 static_cast<unsigned long long>(s.draw_idx), addr0, addr1, nverts,
++                 static_cast<unsigned long long>(s.ucount), use_gs, path, Djb2(uni, uni_bytes),
++                 Djb2(vtx, vtx_bytes), static_cast<unsigned long long>(hash_prog),
++                 static_cast<unsigned long long>(hash_swz));
++}
++
++inline void NoteCmdList(u32 addr, u32 size) {
++    if (!On()) {
++        return;
++    }
++    State& s = S();
++    std::fprintf(s.f, "L %llu %08X %u\n", static_cast<unsigned long long>(s.frame), addr, size);
++}
++
++inline void NoteUniformWrite(u32 first, u32 count, const u32* values) {
++    if (!On()) {
++        return;
++    }
++    State& s = S();
++    if (s.ucount == 0) {
++        s.ufirst = first;
++        s.ufirst_val = (count > 0) ? values[0] : 0;
++    }
++    s.ulast = static_cast<u64>(first) + count;
++    for (u32 i = 0; i < count; ++i) {
++        s.uxor ^= values[i];
++    }
++    s.ucount += count;
++}
++
++// Uniforms are a persistent register file, so almost every vec4 repeats unchanged from
++// frame to frame. Emitting only the deltas keeps the trace ~20x smaller and avoids
++// slowing the emulator down to the point where the frame rate itself perturbs the data.
++inline void NoteUniformState(u32 nverts, const std::array<float, 384>& v) {
++    if (!On()) {
++        return;
++    }
++    if (nverts < 16) {
++        return;
++    }
++    State& s = S();
++    if (s.draw_idx >= 1024) {
++        return;
++    }
++    static u32 prev_uni[1024][96][4];
++    static bool prev_valid[1024] = {};
++    const u32 d = static_cast<u32>(s.draw_idx);
++    bool any = false;
++    char line[8192];
++    int n = std::snprintf(line, sizeof(line), "U %llu %llu %u", 
++                          static_cast<unsigned long long>(s.frame),
++                          static_cast<unsigned long long>(s.draw_idx), nverts);
++    for (u32 i = 0; i < 96; ++i) {
++        u32 b[4];
++        std::memcpy(b, &v[i * 4], sizeof(b));
++        if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) {
++            continue;
++        }
++        if (prev_valid[d] && prev_uni[d][i][0] == b[0] && prev_uni[d][i][1] == b[1] &&
++            prev_uni[d][i][2] == b[2] && prev_uni[d][i][3] == b[3]) {
++            continue;
++        }
++        prev_uni[d][i][0] = b[0];
++        prev_uni[d][i][1] = b[1];
++        prev_uni[d][i][2] = b[2];
++        prev_uni[d][i][3] = b[3];
++        any = true;
++        if (n < static_cast<int>(sizeof(line)) - 40) {
++            n += std::snprintf(line + n, sizeof(line) - n, " %u=%08X,%08X,%08X,%08X", i, b[0],
++                               b[1], b[2], b[3]);
++        }
++    }
++    prev_valid[d] = true;
++    if (!any) {
++        return;
++    }
++    line[n] = '\n';
++    std::fwrite(line, 1, static_cast<std::size_t>(n) + 1, s.f);
++}
++
++// Vertex attribute layout for the current draw (dumped once per draw on the SW path):
++// C <frame> <draw> <format>:<elements>:<stride> x12
++inline void NoteAttrConfig(const std::array<u32, 36>& cfg) {
++    if (!On()) {
++        return;
++    }
++    State& s = S();
++    if (s.draw_idx >= 1024) {
++        return;
++    }
++    const u32 d = static_cast<u32>(s.draw_idx);
++    static u32 prev_cfg[1024][36];
++    static bool prev_cfg_valid[1024] = {};
++    bool changed = !prev_cfg_valid[d];
++    for (u32 i = 0; i < 36; ++i) {
++        if (prev_cfg[d][i] != cfg[i]) {
++            changed = true;
++            prev_cfg[d][i] = cfg[i];
++        }
++    }
++    prev_cfg_valid[d] = true;
++    if (!changed) {
++        return;
++    }
++    std::fprintf(s.f, "C %llu %llu", static_cast<unsigned long long>(s.frame),
++                 static_cast<unsigned long long>(s.draw_idx));
++    for (u32 i = 0; i < 12; ++i) {
++        std::fprintf(s.f, " %u:%u:%u", cfg[i * 3 + 0], cfg[i * 3 + 1], cfg[i * 3 + 2]);
++    }
++    std::fputc('\n', s.f);
++}
++
++// Decoded attributes of one vertex (SW path only; the HW path never runs VertexLoader).
++// V <frame> <draw> <vertex> <nattr> <i>=<b,b,b,b> ...
++inline void NoteVertex(u32 vertex, const std::array<float, 64>& v, u32 nattr) {
++    if (!On()) {
++        return;
++    }
++    State& s = S();
++    if (s.draw_idx >= 1024) {
++        return;
++    }
++    const u32 d = static_cast<u32>(s.draw_idx);
++    static u32 prev_vtx[1024][16][4];
++    static bool prev_vtx_valid[1024] = {};
++    bool any = false;
++    char line[2048];
++    int n = std::snprintf(line, sizeof(line), "V %llu %llu %u %u",
++                          static_cast<unsigned long long>(s.frame),
++                          static_cast<unsigned long long>(s.draw_idx), vertex, nattr);
++    for (u32 i = 0; i < nattr; ++i) {
++        u32 b[4];
++        std::memcpy(b, &v[i * 4], sizeof(b));
++        if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) {
++            continue;
++        }
++        if (prev_vtx_valid[d] && prev_vtx[d][i][0] == b[0] && prev_vtx[d][i][1] == b[1] &&
++            prev_vtx[d][i][2] == b[2] && prev_vtx[d][i][3] == b[3]) {
++            continue;
++        }
++        prev_vtx[d][i][0] = b[0];
++        prev_vtx[d][i][1] = b[1];
++        prev_vtx[d][i][2] = b[2];
++        prev_vtx[d][i][3] = b[3];
++        any = true;
++        if (n < static_cast<int>(sizeof(line)) - 48) {
++            n += std::snprintf(line + n, sizeof(line) - n, " %u=%08X,%08X,%08X,%08X", i, b[0],
++                               b[1], b[2], b[3]);
++        }
++    }
++    prev_vtx_valid[d] = true;
++    if (!any) {
++        return;
++    }
++    line[n] = '\n';
++    std::fwrite(line, 1, static_cast<std::size_t>(n) + 1, s.f);
++}
++
++inline void NoteDraw(u32 base, u32 nverts, u32 use_gs, u32 path) {
++    if (!On()) {
++        return;
++    }
++    State& s = S();
++    std::fprintf(s.f, "D %llu %llu %08X %u %llu %llu %llu %08X %08X %u p=%u\n",
++                 static_cast<unsigned long long>(s.frame),
++                 static_cast<unsigned long long>(s.draw_idx), base, nverts,
++                 static_cast<unsigned long long>(s.ucount),
++                 static_cast<unsigned long long>(s.ufirst),
++                 static_cast<unsigned long long>(s.ulast), s.uxor, s.ufirst_val, use_gs, path);
++    ++s.draw_idx;
++    ResetUniforms();
++}
++
++} // namespace MoFTrace
